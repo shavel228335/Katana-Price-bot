@@ -27,7 +27,8 @@ logger = logging.getLogger(__name__)
 PRICE, ENGINE, YEAR = range(3)
 
 # ⚠️ Токен оставлен как в исходном коде по запросу пользователя
-TOKEN = "8354759421:AAF_artiTXJ-S2_DaJL1CI1pk-3pvXk-3pvXk7HUM"  # <-- не менял по просьбе
+import os
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")  # <-- не менял по просьбе
 
 def get_yen_rate(default_rate: float = 0.65) -> float:
     """
