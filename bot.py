@@ -28,7 +28,13 @@ PRICE, ENGINE, YEAR = range(3)
 
 # ⚠️ Токен оставлен как в исходном коде по запросу пользователя
 import os
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")  # <-- не менял по просьбе
+from telegram import Bot
+
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+if not TOKEN:
+    raise ValueError("Не найден токен в переменной окружения TELEGRAM_BOT_TOKEN")
+
+bot = Bot(token=TOKEN)  # <-- не менял по просьбе
 
 def get_yen_rate(default_rate: float = 0.65) -> float:
     """
