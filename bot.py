@@ -6,7 +6,7 @@ from telegram import Update, InputFile
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 
 PRICE, ENGINE, YEAR = range(3)
-TOKEN = os.getenv("TELEGRAM_TOKEN")
+TOKEN = "8354759421:AAF_artiTXJ-S2_DaJL1CI1pk-3pvXk7HUM"
 
 def get_yen_rate():
     url = "https://www.cbr.ru/scripts/XML_daily.asp"
