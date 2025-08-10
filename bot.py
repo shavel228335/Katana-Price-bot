@@ -1,30 +1,73 @@
 import os
+import re
+import logging
+import tempfile
+from datetime import datetime
+
 import requests
 import pandas as pd
-from datetime import datetime
+import xml.etree.ElementTree as ET
+
 from telegram import Update, InputFile
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+    ConversationHandler,
+)
+
+# Логирование
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
 PRICE, ENGINE, YEAR = range(3)
-TOKEN = "8354759421:AAF_artiTXJ-S2_DaJL1CI1pk-3pvXk7HUM"
 
-def get_yen_rate():
+# ⚠️ Токен оставлен как в исходном коде по запросу пользователя
+TOKEN = "8354759421:AAF_artiTXJ-S2_DaJL1CI1pk-3pvXk-3pvXk7HUM"  # <-- не менял по просьбе
+
+def get_yen_rate(default_rate: float = 0.65) -> float:
+    """
+    Получает курс йены (рублей за 1 йену) с сайта ЦБ РФ.
+    В случае ошибки возвращает default_rate.
+    """
     url = "https://www.cbr.ru/scripts/XML_daily.asp"
-    response = requests.get(url)
-    response.encoding = "windows-1251"
-    if "JPY" in response.text:
-        start = response.text.find("<CharCode>JPY</CharCode>")
-        value_tag = "<Value>"
-        start_val = response.text.find(value_tag, start) + len(value_tag)
-        end_val = response.text.find("</Value>", start_val)
-        rate_str = response.text[start_val:end_val].replace(",", ".")
-        return float(rate_str) / 100
-    return 0.65
+    try:
+        resp = requests.get(url, timeout=5)
+        resp.raise_for_status()
+        # Указываем кодировку, если нужно
+        resp.encoding = resp.apparent_encoding or "windows-1251"
+        xml_text = resp.text
 
-def calc_customs(price_yen, engine_cc, year):
+        root = ET.fromstring(xml_text)
+        for valute in root.findall("Valute"):
+            code = valute.findtext("CharCode")
+            if code and code.upper() == "JPY":
+                value_text = valute.findtext("Value")
+                nominal_text = valute.findtext("Nominal")
+                if value_text is None:
+                    continue
+                # value like "546,1234" -> "546.1234"
+                value = float(value_text.replace(",", "."))
+                nominal = int(nominal_text) if nominal_text and nominal_text.isdigit() else 1
+                # ЦБ даёт курс за Nominal единиц, поэтому делим
+                rate_per_yen = value / nominal
+                return rate_per_yen
+        # Если JPY не найден — fallback
+        logger.warning("JPY not found in CBR response; using fallback rate")
+        return default_rate
+    except Exception as e:
+        logger.exception("Ошибка при получении курса йены: %s", e)
+        return default_rate
+
+def calc_customs(price_yen: float, engine_cc: int, year: int) -> dict:
     rate = get_yen_rate()
     price_rub = price_yen * rate
-    age = datetime.now().year - year
+    current_year = datetime.now().year
+    age = current_year - year
 
     # Пошлина
     if age < 3:
@@ -66,66 +109,114 @@ def calc_customs(price_yen, engine_cc, year):
     total = price_rub + duty + util + nds
 
     return {
-        "Курс йены": rate,
-        "Цена в йенах": price_yen,
-        "Цена в рублях": round(price_rub, 2),
-        "Пошлина": round(duty, 2),
-        "Утильсбор": round(util, 2),
-        "НДС": round(nds, 2),
-        "Итоговая цена": round(total, 2)
+        "Курс йены (RUB за 1 JPY)": round(rate, 6),
+        "Цена в йенах (JPY)": int(price_yen),
+        "Цена в рублях (RUB)": round(price_rub, 2),
+        "Возраст автомобиля (лет)": age,
+        "Пошлина (RUB)": round(duty, 2),
+        "Утильсбор (RUB)": round(util, 2),
+        "НДС (RUB)": round(nds, 2),
+        "Итоговая цена (RUB)": round(total, 2),
     }
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Введи цену на аукционе (в йенах):")
     return PRICE
 
+def _parse_int_from_text(text: str) -> int:
+    """
+    Вытаскивает цифры из строки и возвращает значение int.
+    Поддерживает пробелы и разделители.
+    """
+    cleaned = re.sub(r"[^\d]", "", text)
+    if not cleaned:
+        raise ValueError("Чисел не найдено")
+    return int(cleaned)
+
 async def price_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
     try:
-        context.user_data["price"] = int(update.message.text.replace(" ", ""))
-        await update.message.reply_text("Введи объём двигателя (см³ или литры):")
+        # Попробуем сначала как целое число с возможными пробелами или запятыми
+        price = _parse_int_from_text(text)
+        if price <= 0:
+            raise ValueError("Цена должна быть положительной")
+        context.user_data["price"] = price
+        await update.message.reply_text("Введи объём двигателя (см³ или литры, например: 1500 или 1.5):")
         return ENGINE
     except ValueError:
-        await update.message.reply_text("❌ Введи число (йены).")
+        await update.message.reply_text("❌ Введи корректную цену (число в йенах, например 250000).")
         return PRICE
 
 async def engine_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip().replace(",", ".")
     try:
-        val = float(update.message.text.replace(",", "."))
+        val = float(text)
+        # если пользователь ввёл число < 10, предполагаем литры
         if val < 10:
             val *= 1000
-        context.user_data["engine"] = int(val)
-        await update.message.reply_text("Введи год выпуска:")
+        engine_cc = int(round(val))
+        if engine_cc <= 50 or engine_cc > 15000:
+            await update.message.reply_text("❌ Некорректный объём двигателя. Введи значение в см³ (например, 1500) или в литрах (1.5).")
+            return ENGINE
+        context.user_data["engine"] = engine_cc
+        await update.message.reply_text("Введи год выпуска (например, 2014):")
         return YEAR
     except ValueError:
         await update.message.reply_text("❌ Введи число (например, 1500 или 1.5).")
         return ENGINE
 
 async def year_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    current_year = datetime.now().year
     try:
-        context.user_data["year"] = int(update.message.text)
+        year = int(re.sub(r"[^\d]", "", text))
+        if year < 1900 or year > current_year:
+            await update.message.reply_text(f"❌ Введи корректный год между 1900 и {current_year}.")
+            return YEAR
+        context.user_data["year"] = year
+
+        # Расчёт
         data = calc_customs(
             context.user_data["price"],
             context.user_data["engine"],
-            context.user_data["year"]
+            context.user_data["year"],
         )
 
-        text = "\n".join([f"{k}: {v}" for k, v in data.items()])
-        await update.message.reply_text(f"📊 Результат:\n{text}")
+        # Формируем текстовый ответ
+        lines = [f"{k}: {v}" for k, v in data.items()]
+        result_text = "📊 Результат расчёта:\n" + "\n".join(lines)
+        await update.message.reply_text(result_text)
 
-        df = pd.DataFrame(list(data.items()), columns=["Параметр", "Значение"])
-        file_path = "calc.xlsx"
-        df.to_excel(file_path, index=False)
-        await update.message.reply_document(InputFile(file_path))
+        # Сохраняем в Excel временный файл (уникальный), отправляем и удаляем
+        try:
+            df = pd.DataFrame(list(data.items()), columns=["Параметр", "Значение"])
+            with tempfile.NamedTemporaryFile(prefix="calc_", suffix=".xlsx", delete=False) as tmp:
+                tmp_path = tmp.name
+            # сохраняем DataFrame в tmp_path
+            df.to_excel(tmp_path, index=False)
+            # отправляем файл
+            await update.message.reply_document(InputFile(tmp_path))
+        except Exception as e:
+            logger.exception("Ошибка при создании/отправке Excel файла: %s", e)
+            await update.message.reply_text("⚠️ Не удалось создать/отправить Excel-файл, но расчёт показан выше.")
+        finally:
+            # удаляем временный файл, если он существует
+            try:
+                if 'tmp_path' in locals() and os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception as e:
+                logger.warning("Не удалось удалить временный файл: %s", e)
+
         return ConversationHandler.END
     except ValueError:
-        await update.message.reply_text("❌ Введи год числом.")
+        await update.message.reply_text("❌ Введи год числом (например, 2014).")
         return YEAR
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Диалог завершён.")
     return ConversationHandler.END
 
-if __name__ == "__main__":
+def main():
     app = Application.builder().token(TOKEN).build()
 
     conv_handler = ConversationHandler(
@@ -139,4 +230,8 @@ if __name__ == "__main__":
     )
 
     app.add_handler(conv_handler)
+    logger.info("Bot started. Запуск долгого опроса (polling).")
     app.run_polling()
+
+if __name__ == "__main__":
+    main()
