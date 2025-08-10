@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import os
 import requests
 import datetime
@@ -12,53 +9,26 @@ from telegram.ext import (
 )
 from openpyxl import Workbook, load_workbook
 
-# ===== Конфиг =====
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")  # обязателен в Render/Env
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))  # ваш Telegram ID (число)
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 FILE_NAME = "calculations.xlsx"
 
-# Состояния для ConversationHandler
-PRICE, ENGINE, YEAR, DELIVERY, FREIGHT, BROKER = range(6)
+PRICE, ENGINE, YEAR_OR_RATE, DELIVERY, FREIGHT, BROKER = range(6)
 
-# Настройка логов
-logging.basicConfig(
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-if not BOT_TOKEN:
-    logger.error("BOT_TOKEN не задан в переменных окружения. Бот не запустится.")
-    # не выходим, чтобы при тестировании сообщить об ошибке в логах
-
-# ===== Утилиты =====
 def get_jpy_rate():
-    """
-    Берёт курс JPY (1 йена в рублях) с ЦБ РФ.
-    Возвращает float или None в случае ошибки.
-    """
-    urls = [
-        "https://www.cbr-xml-daily.ru/daily_json.js",
-        "https://www.cbr.ru/scripts/XML_daily.asp"  # резерв (не json) - не используем по умолчанию
-    ]
     try:
-        r = requests.get(urls[0], timeout=8)
+        r = requests.get("https://www.cbr-xml-daily.ru/daily_json.js", timeout=8)
         r.raise_for_status()
         data = r.json()
         val = data.get("Valute", {}).get("JPY", {}).get("Value")
-        if val is None:
-            logger.warning("Не найден JPY в ответе ЦБ.")
-            return None
-        return float(val)
-    except Exception as e:
-        logger.exception("Ошибка получения курса ЦБ: %s", e)
+        return float(val) if val is not None else None
+    except:
         return None
 
 def save_to_excel(row):
-    """
-    row - список значений в том порядке, который используем в шапке.
-    Если файла нет — создаёт и добавляет шапку.
-    """
     header = [
         "Дата", "Цена ¥", "Курс ¥", "Цена ₽",
         "Двигатель (см³)", "Год выпуска", "Возраст (лет)",
@@ -71,24 +41,17 @@ def save_to_excel(row):
             ws = wb.active
             ws.append(header)
             wb.save(FILE_NAME)
-
         wb = load_workbook(FILE_NAME)
         ws = wb.active
         ws.append(row)
         wb.save(FILE_NAME)
     except Exception as e:
-        logger.exception("Ошибка при сохранении в Excel: %s", e)
+        logger.exception(e)
 
-def calc_customs(price_rub, age, engine_cc):
-    """
-    Пример расчёта пошлины, как обсуждали выше.
-    Возвращает tuple: (duty, util_fee, vat)
-    Внимание: ставки примерные — при необходимости можно изменить.
-    """
+def calc_customs(price_rub, age, cc):
     if age < 3:
-        duty = price_rub * 0.48  # 48% от таможенной стоимости — пример
+        duty = price_rub * 0.48
     else:
-        cc = engine_cc
         if cc <= 1000:
             duty = cc * 1.5 * 100
         elif cc <= 1500:
@@ -101,203 +64,159 @@ def calc_customs(price_rub, age, engine_cc):
             duty = cc * 3.0 * 100
         else:
             duty = cc * 3.6 * 100
-
     util_fee = 5200 if age < 3 else 8200
-    vat = (price_rub + duty) * 0.2  # 20% НДС
+    vat = (price_rub + duty) * 0.2
     return duty, util_fee, vat
 
-# ===== HANDLERS =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Начало диалога. Получаем курс и просим ввести цену в йенах.
-    """
     rate = get_jpy_rate()
+    context.user_data['rate'] = rate
     if rate:
-        context.user_data['rate'] = rate
-        await update.message.reply_text(
-            f"📈 Актуальный курс: 1 ¥ = {rate:.4f} ₽\n"
-            "Введите цену на аукционе (в йенах), например: 1200000"
-        )
-        return PRICE
+        await update.message.reply_text(f"📈 Курс йены (ЦБ): 1 ¥ = {rate:.4f} ₽\nВведи цену на аукционе (в йенах):")
     else:
-        # если не удалось получить курс, всё равно даём вводить цену, но сообщаем
-        await update.message.reply_text(
-            "⚠️ Не удалось получить курс йены с ЦБ. Введите цену на аукционе (в йенах),\n"
-            "и затем в следующем шаге введите курс вручную (в рублях за 1 ¥)."
-        )
-        context.user_data['rate'] = None
-        return PRICE
+        await update.message.reply_text("⚠️ Не удалось получить курс йены. Введи цену на аукционе (в йенах), затем вручную курс (в рублях).")
+    return PRICE
 
 async def price_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip().replace(",", "").replace(" ", "")
+    txt = update.message.text.strip().replace(",", "").replace(" ", "")
     try:
-        price_yen = float(text)
-        context.user_data['price_yen'] = price_yen
-        # если курса нет — попросим ввести
+        context.user_data['price_yen'] = float(txt)
         if context.user_data.get('rate') is None:
-            await update.message.reply_text("Введи курс йены к рублю (например, 0.6123):")
-            return YEAR  # временно используем слот YEAR для ввода курса
+            await update.message.reply_text("Введи курс йены к рублю (пример: 0.6123):")
+            return YEAR_OR_RATE
         else:
-            await update.message.reply_text("Введи объём двигателя (в см³), например: 1798")
+            await update.message.reply_text("Введи объём двигателя (см³):")
             return ENGINE
     except ValueError:
         await update.message.reply_text("Пожалуйста, введи число — цену в йенах.")
         return PRICE
 
-async def year_as_rate_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Этот хендлер используется только если мы не получили курс автоматически.
-    Пользователь ввёл курс вручную. Далее попросим мотор/год.
-    """
-    text = update.message.text.strip().replace(",", ".")
+async def year_or_rate_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = update.message.text.strip().replace(",", ".")
     try:
-        rate = float(text)
+        rate = float(txt)
         context.user_data['rate'] = rate
-        await update.message.reply_text("Введи объём двигателя (в см³), например: 1798")
+        await update.message.reply_text("Введи объём двигателя (см³):")
         return ENGINE
     except ValueError:
-        await update.message.reply_text("Пожалуйста, введи число — курс в формате 0.6123")
-        return YEAR
+        await update.message.reply_text("Пожалуйста, введи число — курс (например 0.6123).")
+        return YEAR_OR_RATE
 
 async def engine_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
+    txt = update.message.text.strip()
     try:
-        cc = int(text)
+        cc = int(txt)
         context.user_data['engine_cc'] = cc
-        await update.message.reply_text("Введи год выпуска автомобиля (например, 2018):")
-        return YEAR
+        await update.message.reply_text("Введи год выпуска:")
+        return YEAR_OR_RATE
     except ValueError:
-        await update.message.reply_text("Пожалуйста, введи целое число в см³ (например, 1798).")
+        await update.message.reply_text("Пожалуйста, введи целое число (см³).")
         return ENGINE
 
 async def year_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
+    txt = update.message.text.strip()
     try:
-        year = int(text)
-        current_year = datetime.datetime.now().year
-        if year > current_year or year < 1980:
-            await update.message.reply_text(f"Некорректный год. Введи год от 1980 до {current_year}.")
-            return YEAR
+        year = int(txt)
+        cy = datetime.datetime.now().year
+        if year < 1980 or year > cy:
+            await update.message.reply_text(f"Некорректный год. Введи год от 1980 до {cy}.")
+            return YEAR_OR_RATE
         context.user_data['year'] = year
-        context.user_data['age'] = current_year - year
-        await update.message.reply_text("Введи стоимость доставки в порт Японии (в рублях), например: 25000")
+        context.user_data['age'] = cy - year
+        await update.message.reply_text("Введи стоимость доставки в порт Японии (₽):")
         return DELIVERY
     except ValueError:
-        await update.message.reply_text("Пожалуйста, введи год выпуска числом (например, 2018).")
-        return YEAR
+        await update.message.reply_text("Пожалуйста, введи год цифрами.")
+        return YEAR_OR_RATE
 
 async def delivery_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip().replace(",", ".").replace(" ", "")
+    txt = update.message.text.strip().replace(",", ".").replace(" ", "")
     try:
-        context.user_data['delivery'] = float(text)
-        await update.message.reply_text("Введи стоимость фрахта до России (в рублях), например: 45000")
+        context.user_data['delivery'] = float(txt)
+        await update.message.reply_text("Введи стоимость фрахта (₽):")
         return FREIGHT
     except ValueError:
         await update.message.reply_text("Пожалуйста, введи число (рубли).")
         return DELIVERY
 
 async def freight_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip().replace(",", ".").replace(" ", "")
+    txt = update.message.text.strip().replace(",", ".").replace(" ", "")
     try:
-        context.user_data['freight'] = float(text)
-        await update.message.reply_text("Введи услуги брокера (в рублях), например: 15000")
+        context.user_data['freight'] = float(txt)
+        await update.message.reply_text("Введи услуги брокера (₽):")
         return BROKER
     except ValueError:
         await update.message.reply_text("Пожалуйста, введи число (рубли).")
         return FREIGHT
 
 async def broker_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip().replace(",", ".").replace(" ", "")
+    txt = update.message.text.strip().replace(",", ".").replace(" ", "")
     try:
-        broker_fee = float(text)
+        broker = float(txt)
         ctx = context.user_data
-        # основная математика
         price_yen = ctx['price_yen']
         rate = ctx['rate']
-        price_rub = price_yen * rate  # цена в рублях
-
+        price_rub = price_yen * rate
         duty, util_fee, vat = calc_customs(price_rub, ctx['age'], ctx['engine_cc'])
-
         delivery = ctx.get('delivery', 0.0)
         freight = ctx.get('freight', 0.0)
-        total = price_rub + delivery + freight + duty + util_fee + vat + broker_fee
-
-        # Сохранение в Excel
-        save_row = [
+        total = price_rub + delivery + freight + duty + util_fee + vat + broker
+        row = [
             datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             price_yen, rate, round(price_rub, 2),
             ctx['engine_cc'], ctx['year'], ctx['age'],
-            delivery, freight, round(duty, 2), util_fee, round(vat, 2),
-            broker_fee, round(total, 2)
+            delivery, freight, round(duty, 2), util_fee, round(vat, 2), broker, round(total, 2)
         ]
-        save_to_excel(save_row)
-
-        # Формируем подробный ответ
-        breakdown = (
-            "📊 *Подробный расчёт:*\n\n"
-            f"💴 Цена на аукционе: {price_yen:,.0f} ¥ × {rate:.4f} ₽ = {price_rub:,.0f} ₽\n"
-            f"🚢 Доставка в порт Японии: {delivery:,.0f} ₽\n"
-            f"⛴ Фрахт до России: {freight:,.0f} ₽\n"
-            f"💼 Пошлина: {duty:,.0f} ₽\n"
-            f"♻️ Утильсбор: {util_fee:,.0f} ₽\n"
-            f"💰 НДС (20%): {vat:,.0f} ₽\n"
-            f"📑 Услуги брокера: {broker_fee:,.0f} ₽\n\n"
-            f"📅 Возраст авто: {ctx['age']} лет\n"
-            f"💵 *Итого*: {total:,.0f} ₽"
+        save_to_excel(row)
+        text = (
+            "📊 Подробный расчёт:\n\n"
+            f"Цена на аукционе: {price_yen:,.0f} ¥ × {rate:.4f} ₽ = {price_rub:,.0f} ₽\n"
+            f"Доставка в порт Японии: {delivery:,.0f} ₽\n"
+            f"Фрахт: {freight:,.0f} ₽\n"
+            f"Пошлина: {duty:,.0f} ₽\n"
+            f"Утильсбор: {util_fee:,.0f} ₽\n"
+            f"НДС (20%): {vat:,.0f} ₽\n"
+            f"Брокер: {broker:,.0f} ₽\n\n"
+            f"Возраст авто: {ctx['age']} лет\n"
+            f"Итого: {total:,.0f} ₽"
         )
-
-        await update.message.reply_text(breakdown, parse_mode="Markdown")
+        await update.message.reply_text(text)
         return ConversationHandler.END
-
     except ValueError:
         await update.message.reply_text("Пожалуйста, введи число (рубли).")
         return BROKER
     except Exception as e:
-        logger.exception("Ошибка в broker_input: %s", e)
-        await update.message.reply_text("Произошла ошибка при расчёте. Попробуй ещё раз.")
+        logger.exception(e)
+        await update.message.reply_text("Ошибка при расчёте.")
         return ConversationHandler.END
 
 async def export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Отправляет calculations.xlsx только ADMIN_ID.
-    """
-    user_id = update.effective_user.id
-    if user_id != ADMIN_ID:
-        await update.message.reply_text("⛔ У вас нет доступа к этой команде.")
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Нет доступа.")
         return
-
     if not os.path.exists(FILE_NAME):
-        await update.message.reply_text("Файл с расчётами ещё не создан.")
+        await update.message.reply_text("Файл ещё не создан.")
         return
-
-    try:
-        # файл отправляем как документ
-        await context.bot.send_document(chat_id=update.effective_chat.id, document=open(FILE_NAME, "rb"))
-    except Exception as e:
-        logger.exception("Ошибка отправки Excel: %s", e)
-        await update.message.reply_text("Ошибка при отправке файла. Попробуйте позже.")
+    await context.bot.send_document(chat_id=update.effective_chat.id, document=open(FILE_NAME, "rb"))
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Расчёт отменён.")
+    await update.message.reply_text("ОК, отменено.")
     return ConversationHandler.END
 
-# ===== Main =====
 def main():
     if not BOT_TOKEN:
-        logger.error("BOT_TOKEN не задан — завершение.")
+        logger.error("BOT_TOKEN не найден.")
         return
-
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    conv_handler = ConversationHandler(
+    conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
             PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, price_input)],
-            ENGINE: [MessageHandler(filters.TEXT & ~filters.COMMAND, engine_input)],
-            YEAR: [
-                MessageHandler(filters.Regex(r'^\d+(\.\d+)?$') & ~filters.COMMAND, year_as_rate_input),  # если ввод курса (когда rate не был загружен)
+            YEAR_OR_RATE: [
+                MessageHandler(filters.Regex(r'^[0-9]+(\.[0-9]+)?$') & ~filters.COMMAND, year_or_rate_input),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, year_input)
             ],
+            ENGINE: [MessageHandler(filters.TEXT & ~filters.COMMAND, engine_input)],
             DELIVERY: [MessageHandler(filters.TEXT & ~filters.COMMAND, delivery_input)],
             FREIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, freight_input)],
             BROKER: [MessageHandler(filters.TEXT & ~filters.COMMAND, broker_input)],
@@ -305,11 +224,9 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True
     )
-
-    app.add_handler(conv_handler)
+    app.add_handler(conv)
     app.add_handler(CommandHandler("export", export_excel))
-
-    logger.info("Запуск бота...")
+    logger.info("Бот запущен.")
     app.run_polling()
 
 if __name__ == "__main__":
